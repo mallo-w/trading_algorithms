@@ -1,0 +1,141 @@
+import backtrader as bt
+import pandas as pd
+import numpy as np
+import requests
+
+# Set your Alpha Vantage API key
+api_key = 'CHWVXYLJ1M3KBV5Q'
+
+# Function to fetch historical daily data from Alpha Vantage
+def fetch_alpha_vantage_data(symbol, interval='daily'):
+    url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={symbol}&apikey={api_key}&outputsize=full'
+    response = requests.get(url)
+    data = response.json()
+
+    if 'Time Series (Daily)' in data:
+        df = pd.DataFrame.from_dict(data['Time Series (Daily)'], orient='index')
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Adjusted Close', 'Volume', 'Dividend Amount', 'Split Coefficient']
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        # Convert columns to numeric types
+        df = df.apply(pd.to_numeric)
+
+        return df
+    else:
+        print(f"Error fetching data for {symbol}: {data}")
+        raise ValueError(f"Error fetching data for {symbol} from Alpha Vantage")
+
+# Define the strategy
+class EWMACStrategy(bt.Strategy):
+    params = (
+        ('ewma_short', 16),
+        ('ewma_long', 64),
+        ('scaling_factor', 4.1),
+        ('cap', 20),
+        ('capital', 100000),
+        ('idm', 1),
+        ('weight', 1),
+        ('tau', 1),
+        ('multiplier', 1),
+        ('fx', 1),
+    )
+
+    def __init__(self):
+        self.ewma_short = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.params.ewma_short)
+        self.ewma_long = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.params.ewma_long)
+        self.stddev = bt.indicators.StandardDeviation(self.data.close, period=self.params.ewma_long)
+
+    def next(self):
+        raw_forecast = (self.ewma_short[0] - self.ewma_long[0]) / self.stddev[0]
+        scaled_forecast = raw_forecast * self.params.scaling_factor
+        capped_forecast = max(min(scaled_forecast, self.params.cap), -self.params.cap)
+
+        N = capped_forecast * self.params.capital * self.params.idm * self.params.weight / (10 * self.params.multiplier * self.data.close[0] * self.params.fx * self.stddev[0])
+        buffer_width = 0.1 * self.params.capital * self.params.idm * self.params.weight * self.params.tau / (self.params.multiplier * self.data.close[0] * self.params.fx * self.stddev[0])
+        lower_buffer = round(N - buffer_width)
+        upper_buffer = round(N + buffer_width)
+
+        current_position = self.getposition().size
+
+        if upper_buffer <= current_position <= lower_buffer:
+            return
+        elif current_position < lower_buffer:
+            self.buy(size=upper_buffer - current_position)
+        elif current_position > upper_buffer:
+            self.sell(size=current_position - upper_buffer)
+
+# Initialize Cerebro engine
+cerebro = bt.Cerebro()
+
+# Fetch data
+start_date = '2020-01-01'
+end_date = '2024-06-07'
+data = fetch_alpha_vantage_data('AAPL', interval='daily')
+
+# Filter data by date range
+data = data[(data.index >= start_date) & (data.index <= end_date)]
+
+# Load data
+datafeed = bt.feeds.PandasData(dataname=data)
+
+# Add data to Cerebro
+cerebro.adddata(datafeed)
+
+# Add strategy to Cerebro
+cerebro.addstrategy(EWMACStrategy)
+
+# Set initial cash
+initial_cash = 100000.0
+cerebro.broker.set_cash(initial_cash)
+
+# Set commission
+cerebro.broker.setcommission(commission=0.001)
+
+# Add analyzers
+cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+
+# Print starting cash
+print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
+
+# Run backtest
+results = cerebro.run()
+strategy = results[0]
+
+# Print final cash
+print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
+
+# Get analyzers
+drawdown = strategy.analyzers.drawdown.get_analysis()
+trade_analyzer = strategy.analyzers.trade_analyzer.get_analysis()
+
+# Print drawdown analysis
+print('Max Drawdown: %.2f%%' % drawdown.max.drawdown)
+print('Max Drawdown Duration: %s' % drawdown.max.len)
+
+# Print trade analysis
+print('Total Trades: %d' % trade_analyzer.total.closed)
+print('Winning Trades: %d' % trade_analyzer.won.total)
+print('Losing Trades: %d' % trade_analyzer.lost.total)
+
+# Check for max losing streak
+max_losing_streak = trade_analyzer.streak.losing.longest if 'streak' in trade_analyzer and 'losing' in trade_analyzer.streak and 'longest' in trade_analyzer.streak.losing else 0
+print('Max Losing Streak: %d' % max_losing_streak)
+
+# Plot results
+cerebro.plot()
+
+# Calculate relative performance
+data['Returns'] = data['Close'].pct_change().cumsum()
+strategy_returns = pd.Series([x[0] for x in strategy.analyzers.trade_analyzer.get_analysis().pnl.net], index=data.index).cumsum()
+
+# Plot relative performance
+plt.figure(figsize=(12, 6))
+plt.plot(data['Returns'], label='AAPL')
+plt.plot(strategy_returns, label='Strategy')
+plt.legend()
+plt.title('Relative Performance of Strategy vs AAPL')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.show()
